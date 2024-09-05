@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 from typing import Optional
 
 import cudf
 import cupy as cp
+import rmm
 import torch
 
 from crossfit.backend.cudf.series import (
@@ -54,20 +56,41 @@ class Predictor(Op):
 
     @torch.no_grad()
     def call(self, data, partition_info=None):
+        cleanup_torch_cache()
         # Get the current CUDA device
-        current_device = torch.cuda.current_device()
+        # current_device = torch.cuda.current_device()
         # Print CUDA memory at the beginning of the method
-        print(f"CUDA memory at start (device {current_device}):")
-        print(torch.cuda.memory_summary(device=current_device))
-
+        # print(f"CUDA memory at start (device {current_device}):")
+        # print(torch.cuda.memory_summary(device=current_device))
+        start_stats = rmm.statistics.get_statistics()
+        data.to_parquet("loader_helper.parquet")
+        print(
+            "RMM MB allocations in the start:",
+            start_stats.current_bytes / (1024 * 1024),
+            flush=True,
+        )
         index = data.index.copy()
         if self.sorted_data_loader:
-            loader = SortedSeqLoader(
-                data[["input_ids", "attention_mask"]],
-                self.model,
-                progress_bar=self.create_progress_bar(len(data), partition_info),
-                initial_batch_size=self.batch_size,
-            )
+            for _ in range(0, 10):
+                stats = rmm.statistics.get_statistics()
+                print(
+                    "RMM MB allocations before creating loader:",
+                    stats.current_bytes / (1024 * 1024),
+                    flush=True,
+                )
+                loader = SortedSeqLoader(
+                    data[["input_ids", "attention_mask"]],
+                    self.model,
+                    progress_bar=self.create_progress_bar(len(data), partition_info),
+                    initial_batch_size=self.batch_size,
+                )
+                stats = rmm.statistics.get_statistics()
+                print(
+                    "RMM MB allocations after creating loader:",
+                    stats.current_bytes / (1024 * 1024),
+                    flush=True,
+                )
+                print("---" * 33)
         else:
             loader = InMemoryLoader(
                 data[["input_ids", "attention_mask"]],
@@ -76,28 +99,54 @@ class Predictor(Op):
                 progress_bar=self.create_progress_bar(len(data), partition_info),
                 max_seq_len=self.model.max_seq_length(),
             )
+        stats = rmm.statistics.get_statistics()
+        print(
+            "RMM MB allocations after creating loader:",
+            stats.current_bytes / (1024 * 1024),
+            flush=True,
+        )
+        padding_side = loader.padding_side
+        pad_token_id = loader.pad_token_id
         del data
+        gc.collect()
+
         all_outputs_ls = []
-        for output in loader.map(self.model.get_model(self.get_worker())):
-            if isinstance(output, dict):
-                if self.model_output_col not in output:
-                    raise ValueError(f"Column '{self.model_output_col}' not found in model output.")
-                output = output[self.model_output_col]
+        for _ in range(0, 10):
+            start_stats = rmm.statistics.get_statistics()
+            print(
+                "RMM MB allocations in the loop start:",
+                start_stats.current_bytes / (1024 * 1024),
+                flush=True,
+            )
+            for output in loader.map(self.model.get_model(self.get_worker())):
+                if isinstance(output, dict):
+                    if self.model_output_col not in output:
+                        raise ValueError(
+                            f"Column '{self.model_output_col}' not found in model output."
+                        )
+                    output = output[self.model_output_col]
 
-            if self.post is not None:
-                output = self.post(output)
+                if self.post is not None:
+                    output = self.post(output)
 
-            all_outputs_ls.append(output)
-
+                all_outputs_ls.append(output)
+            cleanup_torch_cache()
+            end_stats = rmm.statistics.get_statistics()
+            print(
+                "RMM MB allocations in the loop end:",
+                end_stats.current_bytes / (1024 * 1024),
+                flush=True,
+            )
+        _index = loader.sort_column(index.values) if self.sorted_data_loader else index
+        del loader
+        cleanup_torch_cache()
         out = cudf.DataFrame(index=index)
         outputs = cp.asarray(
             concat_and_pad_tensors(
-                all_outputs_ls, pad_token_id=loader.pad_token_id, padding_side=loader.padding_side
+                all_outputs_ls, pad_token_id=pad_token_id, padding_side=padding_side
             )
         )
-        _index = loader.sort_column(index.values) if self.sorted_data_loader else index
         del all_outputs_ls
-        del loader
         cleanup_torch_cache()
         if len(outputs.shape) <= 2:
             out[self.pred_output_col] = create_list_series_from_1d_or_2d_ar(outputs, _index)
@@ -107,10 +156,11 @@ class Predictor(Op):
             raise RuntimeError(f"Unexpected output shape: {output.shape}")
         del outputs, _index
         cleanup_torch_cache()
-
         # Print CUDA memory at the end of the method
-        print(f"CUDA memory at end (device {current_device}):")
-        print(torch.cuda.memory_summary(device=current_device))
+        # print(f"CUDA memory at end (device {current_device}):")
+        # print(torch.cuda.memory_summary(device=current_device))
+        end_stats = rmm.statistics.get_statistics()
+        print("RMM MB allocations in the end:", end_stats.current_bytes / (1024 * 1024), flush=True)
         return out
 
     def meta(self):
