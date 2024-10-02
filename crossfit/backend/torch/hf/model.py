@@ -37,6 +37,7 @@ class HFModel(Model):
         batch_size_increment: int = 256,
         start_seq_len: int = 1,
         seq_len_increment: int = 64,
+        compile_model: bool = True,
     ):
         super().__init__(path_or_name, max_mem_gb)
         self.start_batch_size = start_batch_size
@@ -44,6 +45,7 @@ class HFModel(Model):
         self.batch_size_increment = batch_size_increment
         self.start_seq_len = start_seq_len
         self.seq_len_increment = seq_len_increment
+        self.compile_model = compile_model
 
         cache_dir = os.path.join(CF_HOME, "memory", self.load_cfg()._name_or_path)
         os.makedirs(cache_dir, exist_ok=True)
@@ -91,7 +93,10 @@ class HFModel(Model):
         cleanup_torch_cache()
 
     def load_model(self, device="cuda"):
-        return AutoModel.from_pretrained(self.path_or_name).to(device)
+        model = AutoModel.from_pretrained(self.path_or_name).to(device)
+        if self.compile_model:
+            model = torch.compile(model, mode="max-autotune")
+        return model
 
     def load_tokenizer(self):
         return AutoTokenizer.from_pretrained(self.path_or_name)
